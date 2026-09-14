@@ -1,0 +1,1 @@
+"""Live service activity simulation."""
