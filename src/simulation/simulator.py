@@ -69,7 +69,7 @@ class ServiceActivitySimulator:
         elif next_event == "VEHICLE_DELIVERED":
             new_status = "CLOSED"
             delivered_at = new_time
-        self.repository.update_repair_order_state(
+        updated = self.repository.update_repair_order_state(
             ro_id=ro_id,
             ro_status=new_status,
             actual_ready_at=actual_ready_at,
@@ -77,4 +77,11 @@ class ServiceActivitySimulator:
             customer_arrival_at=customer_arrival_at,
         )
         self.sla_engine.refresh_sla_states()
-        return {"message": f"Simulated new service activity for {ro_id}: {next_event}."}
+        if updated:
+            return {"message": f"Simulated new service activity for {ro_id}: {next_event}."}
+        return {
+            "message": (
+                f"Simulated new service activity for {ro_id}: {next_event}. "
+                "Event history and SLA state were updated. Repair-order header state was left unchanged because of DuckDB foreign-key update limitations."
+            )
+        }

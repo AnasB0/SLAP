@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from pathlib import Path
+import os
+import subprocess
+import sys
 from typing import Any
 
-import gradio as gr
-from fastapi import FastAPI
+import streamlit as st
+import streamlit.runtime
 
 from src.agents.investigation_agent import InvestigationAgent
 from src.agents.mitigation_agent import MitigationAgent
@@ -15,7 +17,7 @@ from src.database.connection import DEFAULT_DB_PATH
 from src.database.repository import WarehouseRepository
 from src.simulation.simulator import ServiceActivitySimulator
 from src.ui.chat import activity_markdown
-from src.ui.dashboard import advisor_chart, compliance_chart, csat_chart, make_kpi_markdown, root_cause_chart, status_chart
+from src.ui.dashboard import advisor_chart, compliance_chart, csat_chart, root_cause_chart, status_chart
 from src.ui.investigation import external_context_markdown, root_cause_markdown, timeline_markdown
 from src.ui.mitigation import plan_markdown
 from src.ui.violations import violations_display_table
@@ -31,69 +33,86 @@ mitigation_agent = MitigationAgent(DB_PATH)
 simulator = ServiceActivitySimulator(DB_PATH)
 
 
-def _empty_app_state() -> dict[str, Any]:
-    return {"selected_ro": "RO-1002", "pending_plan": None, "agent_activity": [], "chat_history": []}
+def _init_state() -> None:
+    st.session_state.setdefault("selected_ro", "RO-1002")
+    st.session_state.setdefault("selected_ro_index", 0)
+    st.session_state.setdefault("pending_plan", None)
+    st.session_state.setdefault("agent_activity", [])
+    st.session_state.setdefault("chat_history", [])
+    st.session_state.setdefault("status_message", "")
+    st.session_state.setdefault("last_investigation", None)
+    st.session_state.setdefault("assistant_prompt", "")
 
 
-def load_dashboard() -> tuple[str, Any, Any, Any, Any, Any, str, str]:
-    kpis = repository.get_kpis()
-    compliance = repository.compliance_breakdown()
-    status_counts = repository.violation_status_counts()
-    root_causes = repository.get_root_cause_summary()
-    advisors = repository.get_advisor_performance()
-    csat = repository.get_customer_satisfaction()
-    recall_demo = "Use the Investigation tab to load live recall context for the selected RO."
-    weather_demo = "Use the Investigation tab to load live weather context."
-    return (
-        make_kpi_markdown(kpis),
-        compliance_chart(compliance),
-        status_chart(status_counts),
-        root_cause_chart(root_causes),
-        advisor_chart(advisors),
-        csat_chart(csat),
-        recall_demo,
-        weather_demo,
-    )
+def _dashboard_snapshot() -> dict[str, Any]:
+    return {
+        "kpis": repository.get_kpis(),
+        "compliance": repository.compliance_breakdown(),
+        "status_counts": repository.violation_status_counts(),
+        "root_causes": repository.get_root_cause_summary(),
+        "advisors": repository.get_advisor_performance(),
+        "csat": repository.get_customer_satisfaction(),
+    }
 
 
-def load_violations() -> tuple[Any, list[str]]:
-    df = repository.get_sla_violations()
-    return violations_display_table(df), df["ro_id"].drop_duplicates().tolist()
+def _violations_data():
+    violations = repository.get_sla_violations()
+    display = violations_display_table(violations)
+    ro_choices = violations["ro_id"].drop_duplicates().tolist()
+    if not ro_choices:
+        ro_choices = repository.get_repair_orders()["ro_id"].tolist()
+    return violations, display, ro_choices
 
 
-def select_ro_from_dropdown(ro_id: str, state: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
-    state["selected_ro"] = ro_id
-    ro = repository.get_repair_order(ro_id)
-    selected_text = f"Selected RO: {ro_id}" if ro else f"Selected RO: {ro_id} not found"
-    return state, selected_text, selected_text
+def _select_ro(ro_id: str) -> None:
+    previous_ro = st.session_state.get("selected_ro")
+    st.session_state.selected_ro = ro_id
+    if previous_ro != ro_id:
+        st.session_state.last_investigation = None
+        st.session_state.pending_plan = None
 
 
-def select_ro_from_table(table, evt: gr.SelectData, state: dict[str, Any]) -> tuple[dict[str, Any], str, str, str]:
-    if table is None or evt is None:
-        return state, state.get("selected_ro", "RO-1002"), f"Selected RO: {state.get('selected_ro', 'RO-1002')}", f"Selected RO: {state.get('selected_ro', 'RO-1002')}"
-    row_index = evt.index[0] if isinstance(evt.index, tuple) else evt.index
-    ro_id = str(table.iloc[row_index]["RO"])
-    state["selected_ro"] = ro_id
-    text = f"Selected RO: {ro_id}"
-    return state, ro_id, text, text
+def _set_selected_ro_from_index(ro_choices: list[str], index: int) -> None:
+    safe_index = max(0, min(index, len(ro_choices) - 1)) if ro_choices else 0
+    st.session_state.selected_ro_index = safe_index
+    if ro_choices:
+        st.session_state.selected_ro = ro_choices[safe_index]
 
 
-def investigate_selected_ro(state: dict[str, Any]) -> tuple[str, str, str, str, dict[str, Any]]:
-    ro_id = state.get("selected_ro") or "RO-1002"
+def _status_variant(message: str) -> str:
+    lowered = message.lower()
+    if "error" in lowered or "failed" in lowered or "not found" in lowered:
+        return "error"
+    if "warning" in lowered or "unchanged" in lowered or "unavailable" in lowered:
+        return "warning"
+    return "success"
+
+
+def _show_status() -> None:
+    message = st.session_state.status_message
+    if not message:
+        return
+    variant = _status_variant(message)
+    if variant == "error":
+        st.error(message)
+    elif variant == "warning":
+        st.warning(message)
+    else:
+        st.success(message)
+
+
+def _queue_assistant_prompt(message: str) -> None:
+    st.session_state.assistant_prompt = message
+
+
+def _run_investigation(ro_id: str) -> dict[str, Any]:
     report = investigation_agent.investigate(ro_id)
     if "error" in report:
-        return report["error"], "", "", "", state
-    root = report["root_cause"]
+        st.session_state.agent_activity = [f"Failed to load {ro_id}"]
+        st.session_state.last_investigation = report
+        return report
     primary_violation = repository.get_primary_violation_for_ro(ro_id)
-    selected_info = (
-        f"{ro_id}\nCustomer: {report['repair_order']['customer_name']}\n"
-        f"Vehicle: {report['repair_order']['make']} {report['repair_order']['model']} {report['repair_order']['model_year']}\n"
-        f"Advisor: {report['repair_order']['advisor_name']}"
-    )
-    timeline = timeline_markdown(report["events"])
-    root_md = root_cause_markdown(root, primary_violation["customer_impact"] if primary_violation else None)
-    context_md = external_context_markdown(report["recalls"], report["weather"])
-    state["agent_activity"] = [
+    st.session_state.agent_activity = [
         f"Found {ro_id}",
         f"Retrieved {len(report['events'])} service events",
         f"Found {len(report['violations'])} SLA violations",
@@ -101,119 +120,315 @@ def investigate_selected_ro(state: dict[str, Any]) -> tuple[str, str, str, str, 
         "Retrieved NHTSA context",
         "Retrieved weather context",
     ]
-    return selected_info, timeline, root_md, context_md, state
+    report["primary_violation"] = primary_violation
+    st.session_state.last_investigation = report
+    return report
 
 
-def generate_mitigation(state: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    ro_id = state.get("selected_ro") or "RO-1002"
+def _generate_plan(ro_id: str) -> str:
     plan = mitigation_agent.generate_plan(ro_id)
-    state["pending_plan"] = asdict(plan) if plan else None
-    status = "Plan ready. Click Execute Mitigation to apply changes." if plan else "No mitigation plan available for this RO."
-    return plan_markdown(plan), status, state
+    st.session_state.pending_plan = asdict(plan) if plan else None
+    return "Plan ready. Review the actions below before execution." if plan else "No mitigation plan available for this RO."
 
 
-def execute_mitigation(state: dict[str, Any]) -> tuple[str, Any, dict[str, Any], str, Any, Any, Any, Any, Any, Any, list[str]]:
-    plan_dict = state.get("pending_plan")
-    if not plan_dict:
-        dashboard = load_dashboard()
-        violations, choices = load_violations()
-        return "No approved mitigation plan is waiting.", repository.get_mitigation_history(), state, *dashboard, violations, choices
-    result = mitigation_agent.execute_mitigation(plan_dict["ro_id"], plan_dict["actions"])
-    state["pending_plan"] = None
-    dashboard = load_dashboard()
-    violations, choices = load_violations()
-    return result["message"], repository.get_mitigation_history(), state, *dashboard, violations, choices
+def _execute_plan() -> str:
+    plan = st.session_state.pending_plan
+    if not plan:
+        return "No approved mitigation plan is waiting."
+    result = mitigation_agent.execute_mitigation(plan["ro_id"], plan["actions"])
+    st.session_state.pending_plan = None
+    return result["message"]
 
 
-def ask_ai(message: str, history: list[tuple[str, str]], state: dict[str, Any]) -> tuple[list[tuple[str, str]], str, dict[str, Any]]:
-    response = orchestrator.handle_request(message, state.get("selected_ro"))
-    history = history + [(message, response["text"])]
-    state["agent_activity"] = response.get("activity_log", [])
+def _submit_assistant_prompt(message: str) -> None:
+    response = orchestrator.handle_request(message, st.session_state.selected_ro)
+    st.session_state.chat_history.append({"role": "user", "content": message})
+    st.session_state.chat_history.append({"role": "assistant", "content": response["text"]})
+    st.session_state.agent_activity = response.get("activity_log", [])
     if response["intent"] == "mitigation" and response.get("data", {}).get("plan") is not None:
-        state["pending_plan"] = asdict(response["data"]["plan"])
-    return history, activity_markdown(state["agent_activity"]), state
+        st.session_state.pending_plan = asdict(response["data"]["plan"])
 
 
-def simulate_activity() -> tuple[str, str, Any, Any, Any, Any, Any, Any, str, str, Any, list[str]]:
-    result = simulator.simulate_new_service_activity()
-    dashboard = load_dashboard()
-    violations, choices = load_violations()
-    return result["message"], *dashboard, repository.get_mitigation_history(), choices
+def _render_kpis(kpis: dict[str, Any]) -> None:
+    labels = [
+        ("Total Repair Orders", kpis.get("total_repair_orders", 0), None),
+        ("Active SLA Violations", kpis.get("active_sla_violations", 0), None),
+        ("Critical Violations", kpis.get("critical_violations", 0), None),
+        ("At-Risk ROs", kpis.get("at_risk_ros", 0), None),
+        ("Mitigated Violations", kpis.get("mitigated_violations", 0), None),
+        ("Average SLA Compliance", f"{kpis.get('average_sla_compliance', 0)}%", None),
+        ("Average Customer Satisfaction", kpis.get("average_customer_satisfaction", 0), None),
+        ("High Customer Impact Cases", kpis.get("high_customer_impact_cases", 0), None),
+    ]
+    cols = st.columns(4)
+    for index, (label, value, delta) in enumerate(labels):
+        with cols[index % 4]:
+            st.metric(label, value, delta)
 
 
-def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Automotive SLA Control Center") as demo:
-        state = gr.State(_empty_app_state())
-        gr.Markdown("# Automotive Service SLA Control Center")
-        with gr.Tabs():
-            with gr.Tab("📊 Dashboard"):
-                kpi_md = gr.Markdown()
-                compliance_plot = gr.Plot()
-                status_plot = gr.Plot()
-                root_plot = gr.Plot()
-                advisor_plot = gr.Plot()
-                csat_plot = gr.Plot()
-                recall_box = gr.Markdown()
-                weather_box = gr.Markdown()
-                simulation_status = gr.Markdown("")
-                refresh_dashboard_btn = gr.Button("🔄 Refresh Dashboard")
-                simulate_btn = gr.Button("🔄 Simulate New Service Activity")
-            with gr.Tab("🚨 Violations"):
-                violations_table = gr.Dataframe(interactive=False)
-                ro_dropdown = gr.Dropdown(label="Select RO", choices=[])
-                selected_label = gr.Markdown("Selected RO: RO-1002")
-                investigate_btn = gr.Button("🔎 Investigate Selected RO")
-                mitigate_btn = gr.Button("🛠️ Mitigate Selected RO")
-            with gr.Tab("🔎 Investigation"):
-                investigation_selected = gr.Markdown()
-                timeline_md = gr.Markdown()
-                root_md = gr.Markdown()
-                context_md = gr.Markdown()
-            with gr.Tab("🛠️ Mitigation"):
-                mitigation_plan_md = gr.Markdown("No mitigation plan generated yet.")
-                mitigation_status_md = gr.Markdown("")
-                execute_btn = gr.Button("▶ Execute Mitigation")
-                mitigation_history = gr.Dataframe(interactive=False)
-            with gr.Tab("💬 AI Assistant"):
-                chatbot = gr.Chatbot(height=420)
-                assistant_input = gr.Textbox(label="Ask the assistant", placeholder="Why is RO-1002 violating SLA?")
-                assistant_send = gr.Button("Send")
-                with gr.Accordion("Agent Activity", open=False):
-                    activity_md = gr.Markdown("No agent activity recorded yet.")
+def _render_sidebar() -> None:
+    st.sidebar.markdown("## Control Panel")
+    ro = repository.get_repair_order(st.session_state.selected_ro)
+    if ro:
+        st.sidebar.markdown(f"**Selected RO**\n\n{st.session_state.selected_ro}")
+        st.sidebar.caption(f"{ro['customer_name']} | {ro['make']} {ro['model']} {ro['model_year']}")
+        violation = repository.get_primary_violation_for_ro(st.session_state.selected_ro)
+        if violation:
+            st.sidebar.metric("Current severity", violation["severity"])
+            st.sidebar.metric("Customer impact", violation["customer_impact"])
+            st.sidebar.metric("Delay", f"{violation['difference_minutes']} min")
+    if st.sidebar.button("Refresh Data", width="stretch", key="sidebar_refresh"):
+        st.session_state.status_message = "Dashboard refreshed from DuckDB."
+    if st.sidebar.button("Simulate Activity", width="stretch", key="sidebar_simulate"):
+        st.session_state.status_message = simulator.simulate_new_service_activity()["message"]
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Demo Prompts")
+    for prompt in [
+        "Check today's SLA violations",
+        "Why is RO-1002 violating SLA?",
+        "Mitigate RO-1002",
+        "Which service advisors have the most SLA breaches?",
+    ]:
+        if st.sidebar.button(prompt, width="stretch", key=f"sidebar_prompt_{prompt}"):
+            _queue_assistant_prompt(prompt)
+            st.session_state.status_message = f"Queued prompt: {prompt}"
 
-        refresh_dashboard_btn.click(
-            load_dashboard,
-            outputs=[kpi_md, compliance_plot, status_plot, root_plot, advisor_plot, csat_plot, recall_box, weather_box],
+
+def _render_dashboard() -> None:
+    snapshot = _dashboard_snapshot()
+    top_bar = st.columns([1, 1, 3])
+    with top_bar[0]:
+        if st.button("Refresh Dashboard", width="stretch", key="dashboard_refresh"):
+            st.session_state.status_message = "Dashboard refreshed from DuckDB."
+    with top_bar[1]:
+        if st.button("Simulate New Service Activity", width="stretch", key="dashboard_simulate"):
+            st.session_state.status_message = simulator.simulate_new_service_activity()["message"]
+    with top_bar[2]:
+        _show_status()
+
+    _render_kpis(snapshot["kpis"])
+    row_one = st.columns(2)
+    row_two = st.columns(2)
+    row_three = st.columns(2)
+    with row_one[0]:
+        st.plotly_chart(compliance_chart(snapshot["compliance"]), width="stretch")
+    with row_one[1]:
+        st.plotly_chart(status_chart(snapshot["status_counts"]), width="stretch")
+    with row_two[0]:
+        st.plotly_chart(root_cause_chart(snapshot["root_causes"]), width="stretch")
+    with row_two[1]:
+        st.plotly_chart(advisor_chart(snapshot["advisors"]), width="stretch")
+    with row_three[0]:
+        st.plotly_chart(csat_chart(snapshot["csat"]), width="stretch")
+    with row_three[1]:
+        st.markdown("### Live External Context")
+        st.caption("Context is shown for the currently selected repair order in Investigation.")
+        st.info("NHTSA and weather context load on demand and fall back gracefully when APIs are unavailable.")
+
+
+def _render_violations() -> None:
+    violations, display, ro_choices = _violations_data()
+    st.markdown("### SLA Violations")
+    st.caption("Click a row to select a repair order, then investigate or prepare mitigation.")
+    selection = st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="violations_table",
+    )
+    selected_rows = list(getattr(selection.selection, "rows", [])) if selection is not None else []
+    if selected_rows:
+        _set_selected_ro_from_index(ro_choices, int(selected_rows[0]))
+
+    selected_ro = st.selectbox(
+        "Select repair order",
+        ro_choices,
+        index=ro_choices.index(st.session_state.selected_ro) if st.session_state.selected_ro in ro_choices else st.session_state.selected_ro_index,
+        key="violations_selectbox",
+    )
+    _select_ro(selected_ro)
+    st.session_state.selected_ro_index = ro_choices.index(selected_ro) if selected_ro in ro_choices else 0
+    st.caption(f"Selected RO: {st.session_state.selected_ro}")
+    actions = st.columns(2)
+    with actions[0]:
+        if st.button("Investigate Selected RO", width="stretch", key="violations_investigate"):
+            _run_investigation(st.session_state.selected_ro)
+            st.session_state.status_message = f"Investigation loaded for {st.session_state.selected_ro}."
+    with actions[1]:
+        if st.button("Prepare Mitigation", width="stretch", key="violations_prepare_mitigation"):
+            st.session_state.status_message = _generate_plan(st.session_state.selected_ro)
+
+    _show_status()
+
+    with st.expander("Top Violation Records", expanded=False):
+        st.dataframe(
+            violations[["ro_id", "violation_type", "severity", "status", "customer_impact", "root_cause", "difference_minutes"]],
+            width="stretch",
+            hide_index=True,
         )
-        simulate_btn.click(
-            simulate_activity,
-            outputs=[simulation_status, kpi_md, compliance_plot, status_plot, root_plot, advisor_plot, csat_plot, recall_box, weather_box, mitigation_history, ro_dropdown],
-        )
-        refresh_dashboard_btn.click(load_violations, outputs=[violations_table, ro_dropdown])
-        violations_table.select(select_ro_from_table, inputs=[violations_table, state], outputs=[state, ro_dropdown, selected_label, investigation_selected])
-        ro_dropdown.change(select_ro_from_dropdown, inputs=[ro_dropdown, state], outputs=[state, selected_label, investigation_selected])
-        investigate_btn.click(investigate_selected_ro, inputs=[state], outputs=[investigation_selected, timeline_md, root_md, context_md, state])
-        mitigate_btn.click(generate_mitigation, inputs=[state], outputs=[mitigation_plan_md, mitigation_status_md, state])
-        execute_btn.click(
-            execute_mitigation,
-            inputs=[state],
-            outputs=[mitigation_status_md, mitigation_history, state, kpi_md, compliance_plot, status_plot, root_plot, advisor_plot, csat_plot, recall_box, weather_box, violations_table, ro_dropdown],
-        )
-        assistant_send.click(ask_ai, inputs=[assistant_input, chatbot, state], outputs=[chatbot, activity_md, state])
-        assistant_input.submit(ask_ai, inputs=[assistant_input, chatbot, state], outputs=[chatbot, activity_md, state])
-
-        demo.load(load_dashboard, outputs=[kpi_md, compliance_plot, status_plot, root_plot, advisor_plot, csat_plot, recall_box, weather_box])
-        demo.load(load_violations, outputs=[violations_table, ro_dropdown])
-        demo.load(lambda: repository.get_mitigation_history(), outputs=[mitigation_history])
-        demo.load(lambda: "Selected RO: RO-1002", outputs=[selected_label])
-
-    return demo
 
 
-app = FastAPI(title="Automotive SLA Agentic AI")
-gradio_app = build_ui()
-app = gr.mount_gradio_app(app, gradio_app, path="/")
+def _render_investigation() -> None:
+    st.markdown(f"### Selected RO: {st.session_state.selected_ro}")
+    actions = st.columns(3)
+    if actions[0].button("Load Investigation", width="stretch", key="investigation_load"):
+        _run_investigation(st.session_state.selected_ro)
+        st.session_state.status_message = f"Investigation refreshed for {st.session_state.selected_ro}."
+    if actions[1].button("Prepare Mitigation from Investigation", width="stretch", key="investigation_prepare_mitigation"):
+        st.session_state.status_message = _generate_plan(st.session_state.selected_ro)
+    if actions[2].button("Ask Why In Assistant", width="stretch", key="investigation_ask_why"):
+        _queue_assistant_prompt(f"Why is {st.session_state.selected_ro} violating SLA?")
+        st.session_state.status_message = f"Queued assistant investigation for {st.session_state.selected_ro}."
+
+    _show_status()
+
+    report = st.session_state.last_investigation
+    if not report or report.get("repair_order", {}).get("ro_id") != st.session_state.selected_ro:
+        st.info("Select a repair order from Violations, then click Load Investigation.")
+        return
+
+    if "error" in report:
+        st.error(report["error"])
+        return
+
+    ro = report["repair_order"]
+    overview = st.columns(3)
+    overview[0].markdown(f"**Customer**\n\n{ro['customer_name']}")
+    overview[1].markdown(f"**Vehicle**\n\n{ro['make']} {ro['model']} {ro['model_year']}")
+    overview[2].markdown(f"**Advisor**\n\n{ro['advisor_name']}")
+
+    details = st.columns([1.2, 1, 1])
+    with details[0]:
+        st.markdown("### Service Timeline")
+        st.code(timeline_markdown(report["events"]), language=None)
+    with details[1]:
+        st.markdown("### Root Cause")
+        primary_violation = report.get("primary_violation")
+        customer_impact = primary_violation["customer_impact"] if primary_violation else None
+        st.markdown(root_cause_markdown(report["root_cause"], customer_impact))
+    with details[2]:
+        st.markdown("### External Context")
+        st.markdown(external_context_markdown(report["recalls"], report["weather"]))
+
+
+def _render_mitigation() -> None:
+    st.markdown(f"### Mitigation for {st.session_state.selected_ro}")
+    action_row = st.columns(2)
+    if action_row[0].button("Generate Mitigation Plan", width="stretch", key="mitigation_generate"):
+        st.session_state.status_message = _generate_plan(st.session_state.selected_ro)
+    if action_row[1].button("Open Mitigation Prompt In Assistant", width="stretch", key="mitigation_queue_prompt"):
+        _queue_assistant_prompt(f"Mitigate {st.session_state.selected_ro}")
+        st.session_state.status_message = f"Queued mitigation prompt for {st.session_state.selected_ro}."
+
+    pending_plan = st.session_state.pending_plan
+    if pending_plan:
+        class _PlanView:
+            def __init__(self, payload: dict[str, Any]) -> None:
+                self.ro_id = payload["ro_id"]
+                self.actions = payload["actions"]
+                self.reason = payload["reason"]
+
+        st.markdown(plan_markdown(_PlanView(pending_plan)))
+        if st.button("Execute Mitigation", type="primary", width="stretch", key="mitigation_execute"):
+            st.session_state.status_message = _execute_plan()
+    else:
+        st.info("No mitigation plan generated yet.")
+
+    _show_status()
+
+    st.markdown("### Mitigation History")
+    st.dataframe(repository.get_mitigation_history(), width="stretch", hide_index=True)
+
+
+def _render_assistant() -> None:
+    st.markdown("### Ask the AI Assistant")
+    queued = st.session_state.assistant_prompt
+    if queued:
+        _submit_assistant_prompt(queued)
+        st.session_state.assistant_prompt = ""
+
+    st.caption(f"Selected RO context: {st.session_state.selected_ro}")
+    prompt = st.chat_input("Ask about violations, mitigation, compliance, recalls, or advisors")
+    if prompt and prompt.strip():
+        _submit_assistant_prompt(prompt.strip())
+
+    quick_prompts = st.columns(4)
+    prompt_labels = [
+        "Check today's SLA violations",
+        f"Why is {st.session_state.selected_ro} violating SLA?",
+        f"Mitigate {st.session_state.selected_ro}",
+        "Which service advisors have the most SLA breaches?",
+    ]
+    for idx, label in enumerate(prompt_labels):
+        if quick_prompts[idx].button(label, width="stretch", key=f"assistant_quick_{idx}"):
+            _submit_assistant_prompt(label)
+
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    with st.expander("Agent Activity", expanded=False):
+        st.markdown(activity_markdown(st.session_state.agent_activity))
+
+
+def main() -> None:
+    st.set_page_config(page_title="Automotive Service SLA Control Center", page_icon="garage", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .stApp { background: linear-gradient(180deg, #0d1117 0%, #111827 100%); color: #f3f4f6; }
+        .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+        [data-testid="stMetricValue"] { color: #f9fafb; }
+        [data-testid="stMetricLabel"] { color: #9ca3af; }
+        div[data-testid="stDataFrame"] { border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; overflow: hidden; }
+        div[data-testid="stMetric"] { background: rgba(17, 24, 39, 0.78); border: 1px solid rgba(148,163,184,0.15); padding: 0.8rem; border-radius: 16px; }
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.element-container .stAlert) { background: transparent; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    _init_state()
+    _render_sidebar()
+
+    st.title("Automotive Service SLA Control Center")
+    st.caption("DuckDB warehouse + deterministic SLA engine + controlled agentic mitigation")
+
+    dashboard_tab, violations_tab, investigation_tab, mitigation_tab, assistant_tab = st.tabs(
+        ["Dashboard", "Violations", "Investigation", "Mitigation", "AI Assistant"]
+    )
+
+    with dashboard_tab:
+        _render_dashboard()
+    with violations_tab:
+        _render_violations()
+    with investigation_tab:
+        _render_investigation()
+    with mitigation_tab:
+        _render_mitigation()
+    with assistant_tab:
+        _render_assistant()
 
 
 if __name__ == "__main__":
-    gradio_app.launch(server_name="0.0.0.0", server_port=7860)
+    if os.environ.get("SLAP_STREAMLIT_CHILD") == "1" or streamlit.runtime.exists():
+        main()
+    else:
+        env = os.environ.copy()
+        env["SLAP_STREAMLIT_CHILD"] = "1"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "streamlit",
+                "run",
+                __file__,
+                "--server.address",
+                "0.0.0.0",
+                "--server.port",
+                "7860",
+            ],
+            check=False,
+            env=env,
+        )

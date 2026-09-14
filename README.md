@@ -1,6 +1,6 @@
 # Automotive SLA Agentic AI + Data Warehouse
 
-This project is a complete local demo of an automotive service operations control center. It combines a DuckDB data warehouse, deterministic SLA monitoring, root-cause analysis, controlled mitigation execution, synthetic dealership data, public-context APIs, and an agent-style natural-language assistant.
+This project is a complete local demo of an automotive service operations control center. It combines a DuckDB data warehouse, deterministic SLA monitoring, root-cause analysis, controlled mitigation execution, synthetic dealership data, public-context APIs, and a Streamlit natural-language assistant console.
 
 The demo is intentionally simple enough for a student presentation while still showing real tool use and real database state changes.
 
@@ -17,7 +17,7 @@ The app includes:
 - Customer impact scoring
 - OpenRouter integration using `openai/gpt-4o-mini`
 - Public API context from NHTSA and Open-Meteo
-- Gradio dashboard with tabs for dashboard, violations, investigation, mitigation, and AI assistant
+- Streamlit dashboard with tabs for dashboard, violations, investigation, mitigation, and AI assistant
 - Simulation of new service activity
 - Pytest coverage for core workflows
 
@@ -44,8 +44,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/AGENTS.md](docs/AGENT
 - Python 3.11+
 - DuckDB
 - Pandas
-- FastAPI
-- Gradio
+- Streamlit
 - Plotly
 - httpx
 - Pydantic
@@ -128,9 +127,13 @@ data/automotive_sla.duckdb
 python app.py
 ```
 
-Then open the local Gradio URL in your browser.
+or directly:
 
-The application mounts Gradio on top of FastAPI, so the project also has a simple web-app structure if you want to extend it later.
+```bash
+streamlit run app.py
+```
+
+Then open the local Streamlit URL in your browser.
 
 ## How the Agents Work
 

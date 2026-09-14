@@ -1,1 +1,1 @@
-"""Gradio UI helpers."""
+"""UI helpers for the Streamlit frontend."""

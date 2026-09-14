@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 import pandas as pd
+import duckdb
 
 from src.database.connection import DEFAULT_DB_PATH, get_connection
 from src.database.queries import KPI_QUERY
@@ -265,19 +266,23 @@ class WarehouseRepository:
         delivered_at: datetime | None = None,
         customer_arrival_at: datetime | None = None,
         technician_id: int | None = None,
-    ) -> None:
-        self.execute(
-            """
-            UPDATE fact_repair_order
-            SET ro_status = ?,
-                actual_ready_at = COALESCE(?, actual_ready_at),
-                delivered_at = COALESCE(?, delivered_at),
-                customer_arrival_at = COALESCE(?, customer_arrival_at),
-                technician_id = COALESCE(?, technician_id)
-            WHERE ro_id = ?
-            """,
-            [ro_status, actual_ready_at, delivered_at, customer_arrival_at, technician_id, ro_id],
-        )
+    ) -> bool:
+        try:
+            self.execute(
+                """
+                UPDATE fact_repair_order
+                SET ro_status = ?,
+                    actual_ready_at = COALESCE(?, actual_ready_at),
+                    delivered_at = COALESCE(?, delivered_at),
+                    customer_arrival_at = COALESCE(?, customer_arrival_at),
+                    technician_id = COALESCE(?, technician_id)
+                WHERE ro_id = ?
+                """,
+                [ro_status, actual_ready_at, delivered_at, customer_arrival_at, technician_id, ro_id],
+            )
+            return True
+        except duckdb.ConstraintException:
+            return False
 
     def insert_mitigation(
         self,
